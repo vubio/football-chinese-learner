@@ -1,36 +1,386 @@
 import streamlit as st
+from gtts import gTTS
+from openai import OpenAI
+from io import BytesIO
+import json
+import requests
+import random
 from supabase import create_client, Client
+from datetime import datetime
 
-# --- 1. INITIALIZE SUPABASE CONNECTION ---
-@st.cache_resource
-def init_connection():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+# 1. Setup Clients & DB
+st.set_page_config(page_title="Football Chinese Coach", layout="wide")
+st.title("⚽ Football & General Chinese Coach")
 
-supabase: Client = init_connection()
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+FOOTBALL_API_KEY = st.secrets["FOOTBALL_API_KEY"]
 
-# --- 2. FETCH DATA ---
-@st.cache_data(ttl=600) # Caches the data for 10 minutes to save API calls
-def fetch_vocab():
-    # Including 'created_at' as requested, alongside the new 'hanzi' and 'pinyin' columns
-    response = supabase.table("vocab_chinese").select("id, created_at, topic, hanzi, pinyin, en, status").execute()
-    return response.data
+try:
+    supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    db_connected = True
+except Exception:
+    db_connected = False
 
-# --- 3. MAIN UI ---
-st.title("⚽ Football Chinese Coach")
+# --- FIFA Broadcast Codes ---
+def get_team_code(team_name):
+    name = team_name.strip().upper()
+    codes = {
+        "USA": "USA", "UNITED STATES": "USA", "BRAZIL": "BRA", "MEXICO": "MEX", 
+        "SOUTH KOREA": "KOR", "JAPAN": "JPN", "GERMANY": "GER", "SPAIN": "ESP", 
+        "FRANCE": "FRA", "ARGENTINA": "ARG", "ENGLAND": "ENG", "PORTUGAL": "POR", 
+        "ITALY": "ITA", "NETHERLANDS": "NED", "BELGIUM": "BEL", "URUGUAY": "URU", 
+        "CANADA": "CAN", "SAUDI ARABIA": "KSA", "QATAR": "QAT", "SWITZERLAND": "SUI", 
+        "MOROCCO": "MAR", "PARAGUAY": "PAR", "CZECH REPUBLIC": "CZE", 
+        "SOUTH AFRICA": "RSA", "HAITI": "HAI", "SCOTLAND": "SCO", 
+        "CURAÇAO": "CUW", "IVORY COAST": "CIV", "COTE D'IVOIRE": "CIV", 
+        "ECUADOR": "ECU", "AUSTRALIA": "AUS", "TURKEY": "TUR", "EGYPT": "EGY", 
+        "TUNISIA": "TUN", "SWEDEN": "SWE", "CAPE VERDE": "CPV", 
+        "BOSNIA-HERZEGOVINA": "BIH", "BOSNIA AND HERZEGOVINA": "BIH"
+    }
+    return codes.get(name, name[:3].upper())
 
-vocab_data = fetch_vocab()
+# Initialize session states properly to avoid auto-generation bugs
+if 'selected_event' not in st.session_state: st.session_state['selected_event'] = None
+if 'study_content' not in st.session_state: st.session_state['study_content'] = []
+if 'last_general_mode' not in st.session_state: st.session_state['last_general_mode'] = "Positions"
+if 'last_match_mode' not in st.session_state: st.session_state['last_match_mode'] = "Player Names"
 
-if vocab_data:
-    for row in vocab_data:
-        with st.container():
-            st.markdown(f"### {row['hanzi']}")
-            st.write(f"**Pinyin:** {row['pinyin']}")
-            st.write(f"**English:** {row['en']}")
+# --- Dynamic AI Topic Generator ---
+def generate_dynamic_topics(domain):
+    prompt = f"""
+    Brainstorm 3 diverse scenarios for practicing {domain} Chinese vocabulary. 
+    You MUST provide:
+    1. One VERY COMMON scenario (e.g., watching a match, talking about scores, simple travel).
+    2. One MODERATE scenario (e.g., tactical discussion, booking a hotel, restaurant orders).
+    3. One RARE or CREATIVE scenario (e.g., locker room drama, historical analysis, or unusual events).
+    
+    Return ONLY a JSON list of exactly 3 strings. Keep them short and clear.
+    """
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o", 
+            temperature=0.8,
+            messages=[
+                {"role": "system", "content": "You are a strict JSON generator. Return only a JSON array of strings."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return json.loads(res.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+    except Exception:
+        return ["Watching a football match", "Discussing match tactics", "Locker room speech"]
+
+# 2. Sidebar: Match Selection
+with st.sidebar:
+    st.header("🏆 World Cup 2026")
+    
+    url = f"https://www.thesportsdb.com/api/v1/json/{FOOTBALL_API_KEY}/eventsseason.php?id=4429&s=2026"
+    
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data and data.get('events'):
+                events = data['events']
+                
+                if st.session_state['selected_event']:
+                    st.success(f"**Active:** {st.session_state['selected_event']['strEvent']}")
+                else:
+                    st.info("Select a match below.")
+                
+                matches_by_date = {}
+                for e in events:
+                    date = e['dateEvent']
+                    if date not in matches_by_date: matches_by_date[date] = []
+                    matches_by_date[date].append(e)
+                
+                st.divider()
+                
+                with st.container(height=600, border=False):
+                    for date in sorted(matches_by_date.keys()):
+                        st.markdown(f"#### 📅 {date}")
+                        for match in matches_by_date[date]:
+                            home = match['strHomeTeam'].strip()
+                            away = match['strAwayTeam'].strip()
+                            
+                            match_name = f"{home} vs {away}"
+                            
+                            if st.button(match_name, key=match['idEvent'], use_container_width=True):
+                                st.session_state['selected_event'] = match
+            else:
+                st.write("No matches found.")
+    except Exception as e:
+        st.error("API Error")
+
+selected_event = st.session_state['selected_event']
+
+# 3. Main Area: Four Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["🌎 General", "⚔️ Match", "🎲 Random", "📚 Vocab Bank"])
+
+# --- TAB 1: General Study ---
+with tab1:
+    st.subheader("Everyday Football Vocabulary")
+    
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        general_mode = st.radio(
+            "Focus Area:",
+            ["Positions", "Common Actions", "Stadium & Fans", "Basic Rules", "Numbers & Stats", "Match Progression", "Emotions"],
+            horizontal=True,
+            key="gen_radio"
+        )
+    with col2:
+        st.write("") 
+        shuffle_gen = st.button("🔄 Shuffle", key="shuffle_gen", use_container_width=True)
+    
+    if st.session_state.get('last_general_mode') != general_mode or shuffle_gen:
+        with st.spinner("Crafting cards..."):
+            gen_prompts = {
+                "Positions": "Provide 8 football positions. Return JSON: [{'topic': 'Position', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Common Actions": "Provide 8 common football verbs in context. Return JSON: [{'topic': 'Verb', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Stadium & Fans": "Provide 8 stadium/fan terms. Return JSON: [{'topic': 'Stadium Vocab', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Basic Rules": "Provide 8 basic rules/phases. Return JSON: [{'topic': 'Rule/Phase', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Numbers & Stats": "Provide 10 phrases involving stats (formations, scorelines, possession). Return JSON: [{'topic': 'Numbers & Stats', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Match Progression": "Provide 8 phrases about match stages (halftime, knockout, extra time). Return JSON: [{'topic': 'Match Stage', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}].",
+                "Emotions": "Provide 8 phrases describing player/fan emotions. Return JSON: [{'topic': 'Emotion', 'hanzi': '1 short sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}]."
+            }
             
-            # Displaying extra metadata at the bottom of each card
-            st.caption(f"Topic: {row['topic']} | Status: {row['status']} | Added: {row['created_at'][:10]}")
-            st.divider()
-else:
-    st.info("No vocabulary found yet. Add some rows to your 'vocab_chinese' table in Supabase!")
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o", temperature=0.9,
+                    messages=[
+                        {"role": "system", "content": "You are a strict JSON generator. No markdown. Max 1 clear Chinese sentence."},
+                        {"role": "user", "content": gen_prompts[general_mode]}
+                    ]
+                )
+                st.session_state['study_content'] = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                st.session_state['current_mode'] = general_mode
+                st.session_state['last_general_mode'] = general_mode
+            except Exception:
+                st.error("Error generating. Try again.")
+
+# --- TAB 2: Match-Specific Study ---
+with tab2:
+    if selected_event:
+        st.subheader(f"Studying: {selected_event['strEvent']}")
+        
+        col1_m, col2_m = st.columns([5, 1])
+        with col1_m:
+            match_mode = st.radio(
+                "Match Focus:",
+                ["Player Names", "Pre-Match Info", "In-Match Phrases", "Tactical Analysis", "Fan Slang", "Referee & VAR"],
+                horizontal=True,
+                key="match_radio"
+            )
+        with col2_m:
+            st.write("") 
+            shuffle_match = st.button("🔄 Shuffle", key="shuffle_match", use_container_width=True)
+        
+        if st.session_state.get('last_match_mode') != match_mode or shuffle_match:
+            with st.spinner("Crafting cards..."):
+                match_prompts = {
+                    "Player Names": f"Identify 8 key players for {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. MUST start sentence with their exact name. Return JSON: [{{'topic': 'Name', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}].",
+                    "Pre-Match Info": f"Provide 8 tactical points for {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. Return JSON: [{{'topic': 'Fact', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}].",
+                    "In-Match Phrases": f"Provide 8 distinct Chinese phrases for watching {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. Return JSON: [{{'topic': 'Context', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}].",
+                    "Tactical Analysis": f"Provide 8 tactical terms relevant to {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. Return JSON: [{{'topic': 'Tactic', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}].",
+                    "Fan Slang": f"Provide 8 slang phrases for fans of {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. Return JSON: [{{'topic': 'Slang', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}].",
+                    "Referee & VAR": f"Provide 8 phrases related to referee decisions during {selected_event['strHomeTeam']} vs {selected_event['strAwayTeam']}. Return JSON: [{{'topic': 'Decision', 'hanzi': '1 short Simplified Chinese sentence', 'pinyin': 'Pinyin with tone marks', 'en': 'English'}}]."
+                }
+                
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o", temperature=0.95,
+                        messages=[
+                            {"role": "system", "content": "You are a strict JSON generator. No markdown. Max 1 clear Chinese sentence."},
+                            {"role": "user", "content": match_prompts[match_mode]}
+                        ]
+                    )
+                    st.session_state['study_content'] = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                    st.session_state['current_mode'] = match_mode
+                    st.session_state['last_match_mode'] = match_mode
+                except Exception:
+                    st.error("Error generating. Try again.")
+    else:
+        st.info("Select a match from the sidebar.")
+
+# --- TAB 3: Random Study ---
+with tab3:
+    st.subheader("🎲 Random Vocabulary Generator")
+    
+    col_domain, col_r1, col_r2 = st.columns([2, 3, 1])
+    
+    with col_domain:
+        domain = st.radio("Topic Domain:", ["Football", "General Chinese"], horizontal=True, key="random_domain")
+    
+    if 'current_domain' not in st.session_state or st.session_state['current_domain'] != domain:
+        with st.spinner(f"Brainstorming {domain} scenarios..."):
+            st.session_state['random_topics'] = generate_dynamic_topics(domain)
+        st.session_state['current_domain'] = domain
+    
+    with col_r1:
+        selected_random_topic = st.radio("Select a Scenario:", st.session_state['random_topics'], horizontal=True)
+        
+    with col_r2:
+        st.write("") 
+        if st.button("🎲 Roll New Scenarios", use_container_width=True):
+            with st.spinner("Brainstorming new topics..."):
+                st.session_state['random_topics'] = generate_dynamic_topics(domain)
+            st.rerun()
+            
+    col_style, col_diff = st.columns(2)
+    with col_style:
+        vocab_style = st.selectbox("Vocabulary Style:", ["Mixed", "Nouns", "Verbs", "Adjectives", "Idioms & Phrases"])
+    with col_diff:
+        difficulty = st.selectbox("Difficulty Level:", ["Easy (Beginner)", "Intermediate", "Hard (Advanced)"])
+        
+    if st.button("Generate Random Content", use_container_width=True):
+        with st.spinner("Crafting random cards..."):
+            
+            context = f"related to football, focusing entirely on the scenario: '{selected_random_topic}'" if domain == "Football" else f"focusing entirely on the scenario: '{selected_random_topic}'"
+            random_prompt = f"Provide exactly 8 {difficulty} Chinese {vocab_style} {context}. Return JSON: [{{'topic': '{selected_random_topic} ({vocab_style})', 'hanzi': '1 short {difficulty} sentence in Simplified Chinese characters', 'pinyin': 'Pinyin with tone marks', 'en': 'English translation'}}]."
+            
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o", temperature=0.95,
+                    messages=[
+                        {"role": "system", "content": "You are a strict JSON generator. No markdown. Max 1 clear Chinese sentence."},
+                        {"role": "user", "content": random_prompt}
+                    ]
+                )
+                st.session_state['study_content'] = json.loads(response.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                st.session_state['current_mode'] = f"Random: {selected_random_topic}"
+            except Exception:
+                st.error("Error generating. Try again.")
+
+
+# --- RENDER GENERATED FLASHCARDS (Tabs 1, 2, & 3) ---
+if st.session_state['study_content'] and st.session_state.get('current_mode'):
+    st.divider()
+    st.header(f"Cards: {st.session_state['current_mode']}")
+    
+    if not db_connected:
+        st.warning("⚠️ Connect Supabase in Secrets to enable the 'Save to Bank' feature!")
+
+    for i, item in enumerate(st.session_state['study_content']):
+        with st.container(border=True):
+            st.caption(item.get('topic', ''))
+            col1, col2, col3 = st.columns([5, 2, 1])
+            
+            col1.markdown(f"### :blue[{item['hanzi']}]")
+            col1.write(f"**{item['pinyin']}**")
+            col1.write(f"*{item['en']}*")
+            
+            try:
+                tts = gTTS(text=item['hanzi'], lang='zh-CN')
+                fp = BytesIO()
+                tts.write_to_fp(fp)
+                fp.seek(0) 
+                col2.audio(fp, format="audio/mp3")
+            except Exception:
+                col2.error("Audio error")
+                
+            with col3:
+                st.write("") 
+                if db_connected:
+                    if st.button("💾 Save", key=f"save_{i}_{item['hanzi'][:10]}"):
+                        try:
+                            supabase.table("vocab_chinese").insert({
+                                "topic": item.get("topic", "General"),
+                                "hanzi": item["hanzi"],
+                                "pinyin": item["pinyin"],
+                                "en": item["en"],
+                                "status": "to_learn",
+                                "created_at": datetime.now().strftime("%Y-%m-%d")
+                            }).execute()
+                            st.toast("✅ Saved to Bank!")
+                        except Exception as e:
+                            st.error("Failed to save.")
+
+# --- TAB 4: My Vocab Bank ---
+BUCKETS = {
+    "To Learn": "to_learn",
+    "Easy": "easy",
+    "Hard": "hard",
+    "Easy-Learnt": "easy_learnt",
+    "Hard-Learnt": "hard_learnt",
+    "Impossible": "impossible",
+    "Impossible-Learnt": "impossible_learnt",
+    "Archived": "archive"
+}
+
+with tab4:
+    if not db_connected:
+        st.info("Your saved vocabulary will appear here once Supabase is connected.")
+    else:
+        st.header("🗂️ Manage Your Vocabulary")
+        
+        # 1. Fetch data from vocab_chinese
+        all_data = supabase.table("vocab_chinese").select("*").execute().data
+        
+        # 2. Setup Filters
+        col_search, col_bucket = st.columns([2, 1])
+        search_query = col_search.text_input("🔍 Search Characters or Meaning...")
+        
+        status_counts = {val: 0 for val in BUCKETS.values()}
+        for row in all_data:
+            s = row.get("status")
+            if s in status_counts: status_counts[s] += 1
+        display_to_val = {f"{name} ({status_counts.get(val, 0)})": val for name, val in BUCKETS.items()}
+        selected_bucket_display = col_bucket.selectbox("Bucket:", list(display_to_val.keys()))
+        
+        # 3. Date Filter Toggle
+        date_mode = st.radio("Date Filter:", ["All Dates", "Custom Range"], horizontal=True)
+        
+        start_date, end_date = None, None
+        if date_mode == "Custom Range":
+            col_d1, col_d2 = st.columns(2)
+            start_date = col_d1.date_input("From:")
+            end_date = col_d2.date_input("To:")
+
+        st.divider()
+        
+        # 4. Apply Filters
+        query = supabase.table("vocab_chinese").select("*").eq("status", display_to_val[selected_bucket_display])
+        
+        if date_mode == "Custom Range" and start_date and end_date:
+            query = query.gte("created_at", start_date.strftime("%Y-%m-%d")).lte("created_at", end_date.strftime("%Y-%m-%d"))
+            
+        if search_query:
+            query = query.ilike("hanzi", f"%{search_query}%")
+            
+        saved_cards = query.execute().data
+        
+        if not saved_cards:
+            st.write("No vocabulary found.")
+        else:
+            for card in saved_cards:
+                with st.container(border=True):
+                    st.caption(f"{card['topic']} | Added: {card.get('created_at', 'N/A')}")
+                    c1, c2, c3 = st.columns([5, 2, 2])
+                    
+                    c1.markdown(f"#### :blue[{card['hanzi']}]")
+                    c1.write(f"**{card['pinyin']}**")
+                    c1.write(f"*{card['en']}*")
+                    
+                    # Audio
+                    try:
+                        tts = gTTS(text=card['hanzi'], lang='zh-CN')
+                        fp = BytesIO()
+                        tts.write_to_fp(fp)
+                        fp.seek(0) 
+                        c2.audio(fp, format="audio/mp3")
+                    except Exception:
+                        c2.error("Audio error")
+                    
+                    # Status Update Dropdown
+                    with c3:
+                        current_status_name = list(BUCKETS.keys())[list(BUCKETS.values()).index(card['status'])]
+                        new_status_name = st.selectbox(
+                            "Move to:",
+                            list(BUCKETS.keys()),
+                            index=list(BUCKETS.keys()).index(current_status_name),
+                            key=f"status_{card['id']}"
+                        )
+                        
+                        if new_status_name != current_status_name:
+                            supabase.table("vocab_chinese").update({"status": BUCKETS[new_status_name]}).eq("id", card['id']).execute()
+                            st.rerun()
